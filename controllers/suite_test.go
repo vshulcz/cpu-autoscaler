@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,11 +26,21 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	clientgoscheme.AddToScheme(scheme)
-	appsv1.AddToScheme(scheme)
-	corev1.AddToScheme(scheme)
-	autoscalingv2.AddToScheme(scheme)
-	v1.AddToScheme(scheme)
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		log.Printf("add core scheme: %v", err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		log.Printf("add apps scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		log.Printf("add corev1 scheme: %v", err)
+	}
+	if err := autoscalingv2.AddToScheme(scheme); err != nil {
+		log.Printf("add autoscalingv2 scheme: %v", err)
+	}
+	if err := v1.AddToScheme(scheme); err != nil {
+		log.Printf("add v1 scheme: %v", err)
+	}
 
 	crdDir := filepath.Join("..", "config", "crd", "bases")
 	testEnv = &envtest.Environment{

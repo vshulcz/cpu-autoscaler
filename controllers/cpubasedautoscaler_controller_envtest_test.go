@@ -27,13 +27,15 @@ func TestReconcile_ScaleUpAndStatusUpdate(t *testing.T) {
 	crName := "my-app-cpuba"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"gauges": map[string]float64{
 				"CPUutilization1": 80.0,
 				"CPUutilization2": 70.0,
 			},
 			"counters": map[string]int64{"PollCount": 123},
-		})
+		}); err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
 	}))
 	defer srv.Close()
 

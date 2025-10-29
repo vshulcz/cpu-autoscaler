@@ -81,7 +81,8 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&leaderElResourceType, "leader-election-resource-lock", resourcelock.LeasesResourceLock, "Leader election resource lock type.")
+	flag.StringVar(&leaderElResourceType, "leader-election-resource-lock",
+		resourcelock.LeasesResourceLock, "Leader election resource lock type.")
 	flag.IntVar(&workers, "workers", 2, "Concurrent reconciles per controller.")
 	flag.StringVar(&httpBind, "http-bind", ":8080", "Internal HTTP bind (reserved for future debug/api).")
 	flag.StringVar(&logLevel, "log-level", "info", "Log level: info|debug.")

@@ -73,7 +73,8 @@ func (r *CPUBasedAutoscalerReconciler) PreviewPlan(ctx context.Context, in Previ
 			snap, err := cli.Snapshot(reqCtx)
 			cancel()
 			if err == nil {
-				if avg, err := metrics.AggregateCPUPercent(snap.Gauges, orDefault(goSrc.CPUKeyPrefix, "CPUutilization")); err == nil {
+				if avg, err := metrics.AggregateCPUPercent(snap.Gauges,
+					orDefault(goSrc.CPUKeyPrefix, "CPUutilization")); err == nil {
 					cpuNow = avg
 				} else {
 					validMetrics = false

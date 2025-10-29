@@ -11,13 +11,16 @@ import (
 
 func TestClient_Snapshot_OK(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"gauges": map[string]float64{
 				"CPUutilization1": 12.3,
 				"HeapAlloc":       123,
 			},
 			"counters": map[string]int64{"PollCount": 7},
-		})
+		}); err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
 	}))
 	defer s.Close()
 
@@ -45,10 +48,12 @@ func TestClient_Snapshot_RetryOn502(t *testing.T) {
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"gauges":   map[string]float64{"CPUutilization1": 42},
 			"counters": map[string]int64{},
-		})
+		}); err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
 	}))
 	defer s.Close()
 

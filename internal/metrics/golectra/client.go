@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -109,10 +110,16 @@ func (c *Client) doOnce(ctx context.Context) (metrics.Snapshot, error) {
 	if err != nil {
 		return metrics.Snapshot{}, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("golectra client: close response body: %v\n", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			log.Printf("golectra client: discard body on error status: %v\n", err)
+		}
 		return metrics.Snapshot{}, fmt.Errorf("http status: %s", resp.Status)
 	}
 

@@ -36,6 +36,11 @@ import (
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
+const (
+	DeploymentKind  = "Deployment"
+	StatefulSetKind = "StatefulSet"
+)
+
 type Clock interface{ Now() time.Time }
 
 type realClock struct{}
@@ -52,7 +57,12 @@ type CPUBasedAutoscalerReconciler struct {
 	plannerByKey map[string]*policy.Planner
 }
 
-func NewCPUBAReconciler(c client.Client, sch *runtime.Scheme, rec record.EventRecorder, clk Clock) *CPUBasedAutoscalerReconciler {
+func NewCPUBAReconciler(
+	c client.Client,
+	sch *runtime.Scheme,
+	rec record.EventRecorder,
+	clk Clock,
+) *CPUBasedAutoscalerReconciler {
 	if clk == nil {
 		clk = realClock{}
 	}
@@ -69,7 +79,7 @@ func NewCPUBAReconciler(c client.Client, sch *runtime.Scheme, rec record.EventRe
 func (r *CPUBasedAutoscalerReconciler) SetupWithManager(mgr ctrl.Manager, workers int) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.CPUBasedAutoscaler{}, builder.WithPredicates()).
-		WithOptions(controller.Options{MaxConcurrentReconciles: int(workers)}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: workers}).
 		Complete(r)
 }
 
@@ -97,11 +107,13 @@ func (r *CPUBasedAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.R
 	conflict, conflictMsg := r.detectConflict(ctx, targetNS, a.Spec.TargetRef.Kind, a.Spec.TargetRef.Name)
 	if conflict {
 		r.setCondition(&a, "ConflictingController", metav1.ConditionTrue, "Detected", conflictMsg)
-		r.patchStatus(ctx, &a, func(st *v1.CPUBasedAutoscalerStatus) {
+		if err := r.patchStatus(ctx, &a, func(st *v1.CPUBasedAutoscalerStatus) {
 			st.LastRun = &metav1.Time{Time: now}
 			st.LastError = conflictMsg
 			st.Reason = v1.ReasonFreeze
-		})
+		}); err != nil {
+			logger.Error(err, "status patch failed")
+		}
 		return ctrl.Result{RequeueAfter: dt}, nil
 	}
 	r.setCondition(&a, "ConflictingController", metav1.ConditionFalse, "None", "")
@@ -111,13 +123,15 @@ func (r *CPUBasedAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.R
 		msg := "failed to get target replicas: " + err.Error()
 		r.Recorder.Event(&a, "Warning", "TargetReadError", msg)
 		r.setCondition(&a, "Degraded", metav1.ConditionTrue, "TargetReadError", msg)
-		r.patchStatus(ctx, &a, func(st *v1.CPUBasedAutoscalerStatus) {
+		if err := r.patchStatus(ctx, &a, func(st *v1.CPUBasedAutoscalerStatus) {
 			st.LastRun = &metav1.Time{Time: now}
 			st.LastError = msg
 			st.CurrentReplicas = current
 			st.AppliedReplicas = current
 			st.Reason = v1.ReasonFreeze
-		})
+		}); err != nil {
+			logger.Error(err, "status patch failed")
+		}
 		return ctrl.Result{RequeueAfter: dt}, nil
 	}
 	r.setCondition(&a, "Degraded", metav1.ConditionFalse, "OK", "")
@@ -200,7 +214,7 @@ func (r *CPUBasedAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	applied := current
-	reason := string(dec.Reason)
+	reason := dec.Reason
 	if dec.Reason != policy.ReasonFreeze && dec.Applied != current {
 		if err := r.applyReplicasPatch(ctx, targetNS, a.Spec.TargetRef, dec.Applied); err != nil {
 			reason = string(v1.ReasonFreeze)
@@ -227,11 +241,12 @@ func (r *CPUBasedAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.R
 	r.setCondition(&a, "Ready", metav1.ConditionTrue, "Active", "controller running")
 
 	crReason := v1.DecisionReason(reason)
-	if reason == policy.ReasonMaxStep {
+	switch reason {
+	case policy.ReasonMaxStep:
 		crReason = v1.ReasonMaxStep
-	} else if reason == policy.ReasonFreeze {
+	case policy.ReasonFreeze:
 		crReason = v1.ReasonFreeze
-	} else {
+	default:
 		crReason = v1.ReasonForecast
 	}
 
@@ -281,7 +296,7 @@ func (r *CPUBasedAutoscalerReconciler) detectConflict(ctx context.Context, ns, k
 			soKind, _, _ := unstructured.NestedString(it.Object, "spec", "scaleTargetRef", "kind")
 			soName, _, _ := unstructured.NestedString(it.Object, "spec", "scaleTargetRef", "name")
 
-			matchesKind := (soKind == "" && kind == "Deployment") || (soKind == kind)
+			matchesKind := (soKind == "" && kind == DeploymentKind) || (soKind == kind)
 			if matchesKind && soName == name {
 				return true, fmt.Sprintf("KEDA ScaledObject %s/%s targets the same %s/%s", ns, it.GetName(), kind, name)
 			}
@@ -291,34 +306,43 @@ func (r *CPUBasedAutoscalerReconciler) detectConflict(ctx context.Context, ns, k
 	return false, ""
 }
 
-func (r *CPUBasedAutoscalerReconciler) getCurrentReplicas(ctx context.Context, ns string, tr v1.TargetReference) (int32, string, error) {
+func (r *CPUBasedAutoscalerReconciler) getCurrentReplicas(
+	ctx context.Context,
+	ns string,
+	tr v1.TargetReference,
+) (int32, string, error) {
 	switch tr.Kind {
-	case "Deployment":
+	case DeploymentKind:
 		var d appsv1.Deployment
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &d); err != nil {
-			return 0, "Deployment", err
+			return 0, DeploymentKind, err
 		}
 		if d.Spec.Replicas == nil {
-			return 1, "Deployment", nil
+			return 1, DeploymentKind, nil
 		}
-		return *d.Spec.Replicas, "Deployment", nil
-	case "StatefulSet":
+		return *d.Spec.Replicas, DeploymentKind, nil
+	case StatefulSetKind:
 		var s appsv1.StatefulSet
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &s); err != nil {
-			return 0, "StatefulSet", err
+			return 0, StatefulSetKind, err
 		}
 		if s.Spec.Replicas == nil {
-			return 1, "StatefulSet", nil
+			return 1, StatefulSetKind, nil
 		}
-		return *s.Spec.Replicas, "StatefulSet", nil
+		return *s.Spec.Replicas, StatefulSetKind, nil
 	default:
 		return 0, tr.Kind, fmt.Errorf("unsupported targetRef.kind=%s", tr.Kind)
 	}
 }
 
-func (r *CPUBasedAutoscalerReconciler) applyReplicasPatch(ctx context.Context, ns string, tr v1.TargetReference, replicas int32) error {
+func (r *CPUBasedAutoscalerReconciler) applyReplicasPatch(
+	ctx context.Context,
+	ns string,
+	tr v1.TargetReference,
+	replicas int32,
+) error {
 	switch tr.Kind {
-	case "Deployment":
+	case DeploymentKind:
 		var obj appsv1.Deployment
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &obj); err != nil {
 			return err
@@ -326,7 +350,7 @@ func (r *CPUBasedAutoscalerReconciler) applyReplicasPatch(ctx context.Context, n
 		orig := obj.DeepCopy()
 		obj.Spec.Replicas = ptrI32(replicas)
 		return r.Patch(ctx, &obj, client.MergeFrom(orig))
-	case "StatefulSet":
+	case StatefulSetKind:
 		var obj appsv1.StatefulSet
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &obj); err != nil {
 			return err
@@ -339,13 +363,23 @@ func (r *CPUBasedAutoscalerReconciler) applyReplicasPatch(ctx context.Context, n
 	}
 }
 
-func (r *CPUBasedAutoscalerReconciler) patchStatus(ctx context.Context, a *v1.CPUBasedAutoscaler, mut func(st *v1.CPUBasedAutoscalerStatus)) error {
+func (r *CPUBasedAutoscalerReconciler) patchStatus(
+	ctx context.Context,
+	a *v1.CPUBasedAutoscaler,
+	mut func(st *v1.CPUBasedAutoscalerStatus),
+) error {
 	orig := a.DeepCopy()
 	mut(&a.Status)
 	return r.Status().Patch(ctx, a, client.MergeFrom(orig))
 }
 
-func (r *CPUBasedAutoscalerReconciler) setCondition(a *v1.CPUBasedAutoscaler, condType string, status metav1.ConditionStatus, reason, msg string) {
+func (r *CPUBasedAutoscalerReconciler) setCondition(
+	a *v1.CPUBasedAutoscaler,
+	condType string,
+	status metav1.ConditionStatus,
+	reason,
+	msg string,
+) {
 	conds := a.Status.Conditions
 	now := metav1.Now()
 	newC := metav1.Condition{

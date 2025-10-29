@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -40,12 +41,16 @@ func New(opts Options) *Server {
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			log.Printf("health write failed: %v", err)
+		}
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if s.readyCheck() {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ready"))
+			if _, err := w.Write([]byte("ready")); err != nil {
+				log.Printf("ready write failed: %v", err)
+			}
 			return
 		}
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
@@ -53,7 +58,9 @@ func New(opts Options) *Server {
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("# metrics served by controller-runtime metrics server\n"))
+		if _, err := w.Write([]byte("# metrics served by controller-runtime metrics server\n")); err != nil {
+			log.Printf("metrics banner write failed: %v", err)
+		}
 	})
 
 	mux.HandleFunc("/api/v1/preview-plan", func(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +80,9 @@ func New(opts Options) *Server {
 		status, resp := s.onPreview(r.Context(), body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		w.Write(resp)
+		if _, err := w.Write(resp); err != nil {
+			log.Printf("preview-plan write failed: %v", err)
+		}
 	})
 
 	s.httpServer = &http.Server{
@@ -91,7 +100,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	go func() {
 		<-ctx.Done()
-		s.httpServer.Shutdown(context.Background())
+		if err := s.httpServer.Shutdown(context.Background()); err != nil {
+			log.Printf("http server shutdown: %v", err)
+		}
 	}()
 	return s.httpServer.Serve(ln)
 }
