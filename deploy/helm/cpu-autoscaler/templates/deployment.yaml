@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cpu-autoscaler.fullname" . }}
+  labels: {{- include "cpu-autoscaler.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels: {{- include "cpu-autoscaler.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "cpu-autoscaler.fullname" . }}
+      securityContext:
+        {{- toYaml .Values.pod.securityContext | nindent 8 }}
+      containers:
+        - name: manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "-leader-elect={{ .Values.controller.leaderElection }}"
+            - "-workers={{ .Values.controller.workers }}"
+            - "-http-bind={{ .Values.controller.httpBind }}"
+            - "-metrics-bind-address={{ .Values.controller.metricsBindAddress }}"
+            - "-health-probe-bind-address={{ .Values.controller.healthProbeBindAddress }}"
+            - "-log-level={{ .Values.controller.logLevel }}"
+            - "-metrics-secure={{ .Values.controller.metricsSecure }}"
+          ports:
+            - name: http
+              containerPort: {{ trimPrefix ":" .Values.controller.httpBind | default "8080" | int }}
+            - name: metrics
+              containerPort: {{ trimPrefix ":" .Values.controller.metricsBindAddress | default "9090" | int }}
+            - name: probes
+              containerPort: {{ trimPrefix ":" .Values.controller.healthProbeBindAddress | default "8081" | int }}
+          securityContext:
+            {{- toYaml .Values.pod.containerSecurityContext | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          env:
+            {{- toYaml .Values.pod.extraEnv | nindent 12 }}
+      nodeSelector: {{- toYaml .Values.pod.nodeSelector | nindent 8 }}
+      tolerations: {{- toYaml .Values.pod.tolerations | nindent 8 }}
+      affinity: {{- toYaml .Values.pod.affinity | nindent 8 }}

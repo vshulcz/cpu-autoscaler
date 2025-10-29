@@ -1,0 +1,31 @@
+apiVersion: autoscale.example.com/v1alpha1
+kind: CPUBasedAutoscaler
+metadata:
+  name: demo-app-cpuba
+  namespace: demo
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: demo-app
+    namespace: demo
+  source:
+    type: golectra
+    golectra:
+      baseURL: http://golectra.demo.svc:8080
+      snapshotPath: /api/v1/snapshot
+      timeoutMs: 800
+      cpuKeyPrefix: "CPUutilization"
+  control:
+    mode: reactive
+    targetCPUPercent: 60
+    alpha: 0.4
+    warmupPoints: 3
+    dtSeconds: 15
+  policy:
+    minReplicas: 1
+    maxReplicas: 50
+    maxStepUp: 5
+    maxStepDown: 3
+    stabilizationWindowSec: 60
+    errorFreezeSeconds: 60

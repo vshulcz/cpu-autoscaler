@@ -1,0 +1,52 @@
+image:
+  repository: cpu-autoscaler
+  tag: dev
+  pullPolicy: Never
+
+controller:
+  workers: 2
+  logLevel: info           
+  leaderElection: true
+  metricsSecure: false
+  metricsBindAddress: ":9090"
+  healthProbeBindAddress: ":8081"
+  httpBind: ":8080"
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 20m
+    memory: 64Mi
+
+rbac:
+  clusterScoped: true
+
+service:
+  type: ClusterIP
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+
+prometheusOperator:
+  enabled: false       
+  namespace: ""        
+  interval: 15s
+
+pod:
+  extraEnv: []           
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
