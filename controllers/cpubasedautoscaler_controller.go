@@ -4,16 +4,17 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -22,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "github.com/vshulcz/cpu-autoscaler/api/v1alpha1"
+	"github.com/vshulcz/cpu-autoscaler/internal/conditions"
 	"github.com/vshulcz/cpu-autoscaler/internal/metrics"
 	gcli "github.com/vshulcz/cpu-autoscaler/internal/metrics/golectra"
 	"github.com/vshulcz/cpu-autoscaler/internal/plan/policy"
@@ -32,6 +34,7 @@ import (
 // +kubebuilder:rbac:groups=autoscale.example.com,resources=cpubasedautoscalers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments/scale;statefulsets/scale,verbs=get;update;patch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -53,8 +56,16 @@ type CPUBasedAutoscalerReconciler struct {
 	Recorder record.EventRecorder
 	Clock    Clock
 
-	sesByKey     map[string]*ses.SES
-	plannerByKey map[string]*policy.Planner
+	sesMu    sync.RWMutex
+	sesByKey map[string]*ses.SES
+
+	plannerMu    sync.RWMutex
+	plannerByKey map[string]plannerEntry
+}
+
+type plannerEntry struct {
+	p   *policy.Planner
+	lim policy.Limits
 }
 
 func NewCPUBAReconciler(
@@ -72,7 +83,7 @@ func NewCPUBAReconciler(
 		Recorder:     rec,
 		Clock:        clk,
 		sesByKey:     map[string]*ses.SES{},
-		plannerByKey: map[string]*policy.Planner{},
+		plannerByKey: map[string]plannerEntry{},
 	}
 }
 
@@ -104,12 +115,11 @@ func (r *CPUBasedAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 	dt := time.Duration(maxI32(a.Spec.Control.DTSeconds, 1)) * time.Second
 
-	conflict, conflictMsg := r.detectConflict(ctx, targetNS, a.Spec.TargetRef.Kind, a.Spec.TargetRef.Name)
-	if conflict {
-		r.setCondition(&a, "ConflictingController", metav1.ConditionTrue, "Detected", conflictMsg)
+	if err := r.detectConflict(ctx, targetNS, a.Spec.TargetRef.Kind, a.Spec.TargetRef.Name); err != nil {
+		r.setCondition(&a, "ConflictingController", metav1.ConditionTrue, "Detected", err.Error())
 		if err := r.patchStatus(ctx, &a, func(st *v1.CPUBasedAutoscalerStatus) {
 			st.LastRun = &metav1.Time{Time: now}
-			st.LastError = conflictMsg
+			st.LastError = err.Error()
 			st.Reason = v1.ReasonFreeze
 		}); err != nil {
 			logger.Error(err, "status patch failed")
@@ -275,13 +285,13 @@ func (r *CPUBasedAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.R
 	return ctrl.Result{RequeueAfter: dt}, nil
 }
 
-func (r *CPUBasedAutoscalerReconciler) detectConflict(ctx context.Context, ns, kind, name string) (bool, string) {
+func (r *CPUBasedAutoscalerReconciler) detectConflict(ctx context.Context, ns, kind, name string) error {
 	var hpas autoscalingv2.HorizontalPodAutoscalerList
 	if err := r.List(ctx, &hpas, client.InNamespace(ns)); err == nil {
 		for _, h := range hpas.Items {
 			if h.Spec.ScaleTargetRef.Kind == kind &&
 				h.Spec.ScaleTargetRef.Name == name {
-				return true, fmt.Sprintf("HPA %s/%s targets the same %s/%s", ns, h.Name, kind, name)
+				return fmt.Errorf("HPA %s/%s targets the same %s/%s", ns, h.Name, kind, name)
 			}
 		}
 	}
@@ -298,12 +308,12 @@ func (r *CPUBasedAutoscalerReconciler) detectConflict(ctx context.Context, ns, k
 
 			matchesKind := (soKind == "" && kind == DeploymentKind) || (soKind == kind)
 			if matchesKind && soName == name {
-				return true, fmt.Sprintf("KEDA ScaledObject %s/%s targets the same %s/%s", ns, it.GetName(), kind, name)
+				return fmt.Errorf("KEDA ScaledObject %s/%s targets the same %s/%s", ns, it.GetName(), kind, name)
 			}
 		}
 	}
 
-	return false, ""
+	return nil
 }
 
 func (r *CPUBasedAutoscalerReconciler) getCurrentReplicas(
@@ -311,25 +321,20 @@ func (r *CPUBasedAutoscalerReconciler) getCurrentReplicas(
 	ns string,
 	tr v1.TargetReference,
 ) (int32, string, error) {
+	var scale autoscalingv1.Scale
 	switch tr.Kind {
 	case DeploymentKind:
-		var d appsv1.Deployment
-		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &d); err != nil {
+		obj := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: tr.Name}}
+		if err := r.Client.SubResource("scale").Get(ctx, obj, &scale); err != nil {
 			return 0, DeploymentKind, err
 		}
-		if d.Spec.Replicas == nil {
-			return 1, DeploymentKind, nil
-		}
-		return *d.Spec.Replicas, DeploymentKind, nil
+		return scale.Spec.Replicas, DeploymentKind, nil
 	case StatefulSetKind:
-		var s appsv1.StatefulSet
-		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &s); err != nil {
+		obj := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: tr.Name}}
+		if err := r.Client.SubResource("scale").Get(ctx, obj, &scale); err != nil {
 			return 0, StatefulSetKind, err
 		}
-		if s.Spec.Replicas == nil {
-			return 1, StatefulSetKind, nil
-		}
-		return *s.Spec.Replicas, StatefulSetKind, nil
+		return scale.Spec.Replicas, StatefulSetKind, nil
 	default:
 		return 0, tr.Kind, fmt.Errorf("unsupported targetRef.kind=%s", tr.Kind)
 	}
@@ -341,23 +346,22 @@ func (r *CPUBasedAutoscalerReconciler) applyReplicasPatch(
 	tr v1.TargetReference,
 	replicas int32,
 ) error {
+	var scale autoscalingv1.Scale
 	switch tr.Kind {
 	case DeploymentKind:
-		var obj appsv1.Deployment
-		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &obj); err != nil {
+		obj := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: tr.Name}}
+		if err := r.Client.SubResource("scale").Get(ctx, obj, &scale); err != nil {
 			return err
 		}
-		orig := obj.DeepCopy()
-		obj.Spec.Replicas = ptrI32(replicas)
-		return r.Patch(ctx, &obj, client.MergeFrom(orig))
+		scale.Spec.Replicas = replicas
+		return r.Client.SubResource("scale").Update(ctx, obj, client.WithSubResourceBody(&scale))
 	case StatefulSetKind:
-		var obj appsv1.StatefulSet
-		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: tr.Name}, &obj); err != nil {
+		obj := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: tr.Name}}
+		if err := r.Client.SubResource("scale").Get(ctx, obj, &scale); err != nil {
 			return err
 		}
-		orig := obj.DeepCopy()
-		obj.Spec.Replicas = ptrI32(replicas)
-		return r.Patch(ctx, &obj, client.MergeFrom(orig))
+		scale.Spec.Replicas = replicas
+		return r.Client.SubResource("scale").Update(ctx, obj, client.WithSubResourceBody(&scale))
 	default:
 		return fmt.Errorf("unsupported targetRef.kind=%s", tr.Kind)
 	}
@@ -390,28 +394,8 @@ func (r *CPUBasedAutoscalerReconciler) setCondition(
 		Message:            msg,
 		LastTransitionTime: now,
 	}
-	conds = setOrUpdateCondition(conds, newC)
+	conds = conditions.SetOrUpdate(conds, newC)
 	a.Status.Conditions = conds
-}
-
-func setOrUpdateCondition(conds []metav1.Condition, c metav1.Condition) []metav1.Condition {
-	out := make([]metav1.Condition, 0, len(conds)+1)
-	replaced := false
-	for _, ex := range conds {
-		if ex.Type == c.Type {
-			if ex.Status == c.Status {
-				c.LastTransitionTime = ex.LastTransitionTime
-			}
-			out = append(out, c)
-			replaced = true
-		} else {
-			out = append(out, ex)
-		}
-	}
-	if !replaced {
-		out = append(out, c)
-	}
-	return out
 }
 
 func (r *CPUBasedAutoscalerReconciler) ensureSES(key string, alpha float64, warmup int) *ses.SES {
@@ -421,6 +405,8 @@ func (r *CPUBasedAutoscalerReconciler) ensureSES(key string, alpha float64, warm
 	if alpha <= 0 || alpha > 1 {
 		alpha = 0.4
 	}
+	r.sesMu.Lock()
+	defer r.sesMu.Unlock()
 	if m, ok := r.sesByKey[key]; ok {
 		if m.Alpha != alpha || m.WarmupN != warmup {
 			nm, _ := ses.New(alpha, warmup)
@@ -443,23 +429,16 @@ func (r *CPUBasedAutoscalerReconciler) ensurePlanner(key string, a v1.CPUBasedAu
 		StabilizationWindow: time.Duration(maxI32(a.Spec.Policy.StabilizationWindowSec, 0)) * time.Second,
 		ErrorFreeze:         time.Duration(maxI32(a.Spec.Policy.ErrorFreezeSeconds, 0)) * time.Second,
 	}
-	if p, ok := r.plannerByKey[key]; ok {
-		if !limitsEqual(p, lim) {
-			np, _ := policy.NewPlanner(lim)
-			r.plannerByKey[key] = np
-			return np
+	r.plannerMu.Lock()
+	defer r.plannerMu.Unlock()
+	if entry, ok := r.plannerByKey[key]; ok {
+		if entry.lim == lim {
+			return entry.p
 		}
-		return p
 	}
 	np, _ := policy.NewPlanner(lim)
-	r.plannerByKey[key] = np
+	r.plannerByKey[key] = plannerEntry{p: np, lim: lim}
 	return np
-}
-
-func limitsEqual(p *policy.Planner, lim policy.Limits) bool {
-	_ = p
-	_ = lim
-	return false
 }
 
 func round1(x float64) float64 {
@@ -471,9 +450,6 @@ func orDefault[T ~string](v T, def T) T {
 		return def
 	}
 	return v
-}
-func ptrI32(v int32) *int32 {
-	return &v
 }
 func maxI32(a, b int32) int32 {
 	if a > b {

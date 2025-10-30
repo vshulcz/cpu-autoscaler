@@ -1,8 +1,8 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -68,8 +68,15 @@ func New(opts Options) *Server {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		body, err := ioReadAllLimit(r.Body, 1<<20) // 1 MiB
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
+		defer func() { _ = r.Body.Close() }()
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			var mbErr *http.MaxBytesError
+			if errors.As(err, &mbErr) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
@@ -105,12 +112,4 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 	return s.httpServer.Serve(ln)
-}
-
-func ioReadAllLimit(r io.Reader, limit int64) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(io.LimitReader(r, limit)); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
